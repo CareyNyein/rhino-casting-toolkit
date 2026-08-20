@@ -20,7 +20,7 @@ class WatertightMeshGuardDialog(forms.Dialog[forms.DialogResult]):
             status_body = "The previous repair could not fully seal the geometry.\nChoose another method below:"
         else:
             status_header = "[WARNING] Detected {} OPEN mesh(es) with {} naked edge loop(s).\n\n".format(mesh_count, naked_count)
-            status_body = "This geometry is not watertight and will cause missing wax layers.\nSelect a repair or diagnostic action:"
+            status_body = "This geometry is not watertight and will cause missing wax layers.\nSelect a repair action:"
 
         msg_label = forms.Label()
         msg_label.Text = status_header + status_body
@@ -43,8 +43,8 @@ class WatertightMeshGuardDialog(forms.Dialog[forms.DialogResult]):
         btn_layout = forms.StackLayout()
         btn_layout.Orientation = forms.Orientation.Horizontal
         btn_layout.Spacing = 6
-        btn_layout.Items.Add(forms.StackLayoutItem(btn_fill))
         btn_layout.Items.Add(forms.StackLayoutItem(btn_remesh))
+        btn_layout.Items.Add(forms.StackLayoutItem(btn_fill))
         btn_layout.Items.Add(forms.StackLayoutItem(btn_wizard))
         btn_layout.Items.Add(forms.StackLayoutItem(btn_show))
         btn_layout.Items.Add(forms.StackLayoutItem(btn_ignore))
@@ -77,8 +77,9 @@ class WatertightMeshGuardDialog(forms.Dialog[forms.DialogResult]):
         self.Close()
 
 
-def get_open_mesh_objects(doc):
+def get_mesh_objects(doc):
     open_objects = []
+    closed_objects = []
     total_naked_loops = 0
     for obj in doc.Objects:
         if isinstance(obj.Geometry, Rhino.Geometry.Mesh):
@@ -88,11 +89,13 @@ def get_open_mesh_objects(doc):
                 naked = mesh.GetNakedEdges()
                 if naked:
                     total_naked_loops += len(naked)
-    return open_objects, total_naked_loops
+            else:
+                closed_objects.append(obj)
+    return open_objects, closed_objects, total_naked_loops
 
 
 def execute_auto_fill(doc):
-    open_objects, _ = get_open_mesh_objects(doc)
+    open_objects, _, _ = get_mesh_objects(doc)
     for obj in open_objects:
         mesh = obj.Geometry.DuplicateMesh()
         mesh.FillHoles()
@@ -107,7 +110,7 @@ def execute_auto_fill(doc):
 
 
 def execute_quad_remesh(doc):
-    open_objects, _ = get_open_mesh_objects(doc)
+    open_objects, _, _ = get_mesh_objects(doc)
     meshes_to_remesh = [obj.Geometry for obj in open_objects if isinstance(obj.Geometry, Rhino.Geometry.Mesh)]
     if not meshes_to_remesh:
         return
@@ -147,17 +150,74 @@ def execute_quad_remesh(doc):
         Rhino.UI.Dialogs.ShowMessageBox("QuadRemesh could not automatically solve this geometry.", "Watertight Mesh Guard")
 
 
+def generate_ring_sprue(doc, target_objects, base_radius=1.25, tip_radius=0.75, sprue_length=8.0):
+    meshes = [obj.Geometry for obj in target_objects if isinstance(obj.Geometry, Rhino.Geometry.Mesh)]
+    if not meshes:
+        return
+
+    bbox = Rhino.Geometry.BoundingBox.Empty
+    for m in meshes:
+        bbox.Union(m.GetBoundingBox(True))
+
+    contact_x = (bbox.Min.X + bbox.Max.X) / 2.0
+    contact_y = (bbox.Min.Y + bbox.Max.Y) / 2.0
+    contact_z = bbox.Min.Z
+
+    bottom_plane = Rhino.Geometry.Plane(
+        Rhino.Geometry.Point3d(contact_x, contact_y, contact_z - sprue_length),
+        Rhino.Geometry.Vector3d(0, 0, 1)
+    )
+    
+    trunc_cone = Rhino.Geometry.Cone(bottom_plane, sprue_length + 0.3, base_radius)
+    brep_cone = trunc_cone.ToBrep(True)
+
+    mp = Rhino.Geometry.MeshingParameters.FastRenderMesh
+    sprue_mesh_arr = Rhino.Geometry.Mesh.CreateFromBrep(brep_cone, mp)
+    
+    if not sprue_mesh_arr:
+        return
+
+    sprue_mesh = Rhino.Geometry.Mesh()
+    for sm in sprue_mesh_arr:
+        sprue_mesh.Append(sm)
+
+    sprue_mesh.Weld(math.pi)
+    sprue_mesh.UnifyNormals()
+    sprue_mesh.Normals.ComputeNormals()
+
+    combined_target = Rhino.Geometry.Mesh()
+    for m in meshes:
+        combined_target.Append(m)
+
+    union_result = Rhino.Geometry.Mesh.CreateBooleanUnion([combined_target, sprue_mesh])
+
+    if union_result and len(union_result) > 0 and union_result[0].IsClosed:
+        for obj in target_objects:
+            doc.Objects.Delete(obj.Id, True)
+        doc.Objects.AddMesh(union_result[0])
+    else:
+        doc.Objects.AddMesh(sprue_mesh)
+
+    doc.Views.Redraw()
+    Rhino.RhinoApp.WriteLine("[Watertight Mesh Guard] Parametric casting sprue attached.")
+
+
 def process_repair_workflow(doc):
     is_retry = False
 
     while True:
-        open_objects, total_naked = get_open_mesh_objects(doc)
+        open_objects, closed_objects, total_naked = get_mesh_objects(doc)
 
         if not open_objects:
-            Rhino.UI.Dialogs.ShowMessageBox(
-                "[SUCCESS] All meshes are closed and watertight!\nModel is ready for slicing.",
-                "Watertight Mesh Guard"
+            res = Rhino.UI.Dialogs.ShowMessageBox(
+                "[SUCCESS] Model is verified WATERTIGHT and ready for slicing.\n\n"
+                "Would you like to auto-attach a casting sprue at the base?",
+                "Watertight Mesh Guard",
+                Rhino.UI.Dialogs.ShowMessageBoxButtons.YesNo,
+                Rhino.UI.Dialogs.ShowMessageBoxIcon.Information
             )
+            if res == Rhino.UI.Dialogs.ShowMessageBoxResult.Yes:
+                generate_ring_sprue(doc, closed_objects)
             break
 
         dialog = WatertightMeshGuardDialog(len(open_objects), total_naked, is_retry=is_retry)
@@ -188,7 +248,7 @@ def process_repair_workflow(doc):
             for obj in open_objects:
                 doc.Objects.Select(obj.Id, True)
             Rhino.RhinoApp.RunScript("! _MeshRepair", True)
-            is_retry = True
+            break
 
 
 def on_end_open_document(sender, e):
@@ -201,7 +261,7 @@ def on_end_open_document(sender, e):
         return
 
     doc = e.Document
-    open_objects, _ = get_open_mesh_objects(doc)
+    open_objects, _, _ = get_mesh_objects(doc)
 
     if not open_objects:
         Rhino.RhinoApp.WriteLine("[Watertight Mesh Guard] STL '{}' is verified watertight.".format(os.path.basename(file_path)))
