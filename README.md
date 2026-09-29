@@ -50,6 +50,7 @@ To have the toolkit activate automatically whenever Rhino starts:
 4. Paste your run command:
 
    ```text
+   
    _-RunPythonScript "C:\Path\To\watertight_mesh_guard.py"
    ```
 

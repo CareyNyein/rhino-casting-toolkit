@@ -18,7 +18,7 @@ from System import Guid
 
 
 # SETTINGS
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 HANDLER_KEY = "WATERTIGHT_MESH_GUARD_ATTACHED"
 BACKUP_TAG = "WMG_ORIGINAL_BACKUP"
 BACKUP_CREATED_TAG = "WMG_BACKUP_CREATED"
@@ -69,7 +69,9 @@ def operation(doc, title):
     if isinstance(state, dict):
         state["busy"] = True
     current = {"cancelled": False, "time": 0.0, "label": None, "ui": False,
-               "stage_started": time.time()}
+               "stage_started": time.time(),
+               "label_updates": (rhino_major_version(),
+                   int(getattr(getattr(Rhino.RhinoApp, "Version", None), "Minor", 0))) >= (8, 6)}
     def escape(sender, event):
         current["cancelled"] = True
     active = Rhino.RhinoDoc.ActiveDoc
@@ -110,9 +112,12 @@ def checkpoint(label, fraction=0.0):
         return
     progress["time"] = now
     if progress["ui"]:
-        elapsed = now - progress.get("stage_started", now)
-        display = "{} ({:.0f}s)".format(label, elapsed) if elapsed >= 1 else label
-        Rhino.UI.StatusBar.UpdateProgressMeter(display, int(100 * fraction), True)
+        if progress["label_updates"]:
+            elapsed = now - progress.get("stage_started", now)
+            display = "{} ({:.0f}s)".format(label, elapsed) if elapsed >= 1 else label
+            Rhino.UI.StatusBar.UpdateProgressMeter(display, int(100 * fraction), True)
+        else:
+            Rhino.UI.StatusBar.UpdateProgressMeter(int(100 * fraction), True)
         Rhino.RhinoApp.Wait()
         if progress["cancelled"]:
             raise CheckCancelled("Check cancelled. Completed changes can be undone.")
@@ -1757,6 +1762,37 @@ def process_repair_workflow(doc, analysis=None):
 
 
 # STL EVENTS AND DEFERRED CHECKS
+def _show_check_error(error):
+    if isinstance(error, CheckCancelled):
+        log(str(error))
+        show_message(str(error), "Mesh Check Cancelled")
+    else:
+        log("Mesh check stopped: {}".format(error))
+        show_message("Mesh check could not finish.\n\n{}".format(error))
+
+
+def _check_document(doc, file_path=None, notify_empty=False):
+    state = sc.sticky[HANDLER_KEY]
+    state["busy"] = True
+    try:
+        objects, failing, totals = analyze_document(doc)
+        if not objects:
+            log("No user mesh objects found in the checked document.")
+            if notify_empty:
+                show_message("No meshes to check.\n\nOpen or import an STL; Mesh Guard will check it automatically.",
+                             "Mesh Guard Ready")
+        elif failing:
+            process_repair_workflow(doc, (objects, failing, totals))
+        else:
+            show_clean_confirmation(file_path, totals)
+        return True
+    except Exception as error:
+        _show_check_error(error)
+        return False
+    finally:
+        state["busy"] = False
+
+
 def queue_check(doc, file_path=None):
     state = sc.sticky.get(HANDLER_KEY)
     if doc is not None and isinstance(state, dict):
@@ -1781,45 +1817,44 @@ def on_idle(sender, event):
     if not isinstance(state, dict) or state["busy"] or not state["pending"]:
         return
     for serial, file_path in list(state["pending"].items()):
-        doc = Rhino.RhinoDoc.FromRuntimeSerialNumber(serial)
-        if doc is None:
-            state["pending"].pop(serial, None)
-            continue
-        active = Rhino.RhinoDoc.ActiveDoc
-        if active is None or active.RuntimeSerialNumber != serial:
-            continue
-        if doc.InCommand(False) or doc.Views.ActiveView is None:
-            continue
-        if doc.UndoActive or doc.RedoActive:
-            continue
-        state["pending"].pop(serial, None)
-        state["busy"] = True
         try:
-            objects, failing, totals = analyze_document(doc)
-            if not objects:
-                log("No user mesh objects found in the checked document.")
-            elif failing:
-                process_repair_workflow(doc, (objects, failing, totals))
-            else:
-                show_clean_confirmation(file_path, totals)
-        except CheckCancelled as error:
-            log(str(error))
-            show_message(str(error), "Mesh Check Cancelled")
+            doc = Rhino.RhinoDoc.FromRuntimeSerialNumber(serial)
+            if doc is None:
+                state["pending"].pop(serial, None)
+                continue
+            active = Rhino.RhinoDoc.ActiveDoc
+            if active is None or active.RuntimeSerialNumber != serial:
+                continue
+            if Rhino.Commands.Command.InCommand() or doc.Views.ActiveView is None:
+                continue
+            if doc.UndoActive or doc.RedoActive:
+                continue
+            state["pending"].pop(serial, None)
+            _check_document(doc, file_path)
         except Exception as error:
-            log("Mesh check stopped: {}".format(error))
-            show_message("Mesh analysis could not finish.\n\n{}".format(error))
-        finally:
-            state["busy"] = False
-
+            state["pending"].pop(serial, None)
+            state["busy"] = True
+            try:
+                _show_check_error(error)
+            finally:
+                state["busy"] = False
         return
 
 
 def check_now():
-    if not isinstance(sc.sticky.get(HANDLER_KEY), dict):
-        register()
-    doc = Rhino.RhinoDoc.ActiveDoc
-    if doc is not None:
-        queue_check(doc, doc.Path)
+    try:
+        if not register():
+            return False
+        doc = Rhino.RhinoDoc.ActiveDoc
+        if doc is None:
+            show_message("Open a document, then import an STL to check it.", "Mesh Guard Ready")
+            return False
+        state = sc.sticky[HANDLER_KEY]
+        state["pending"].pop(doc.RuntimeSerialNumber, None)
+        return _check_document(doc, doc.Path, True)
+    except Exception as error:
+        _show_check_error(error)
+        return False
 
 
 # EVENT REGISTRATION
@@ -1844,16 +1879,19 @@ def register():
     if HANDLER_KEY in sc.sticky:
         previous = sc.sticky[HANDLER_KEY]
         if not isinstance(previous, dict):
-            log("An older guard is active. Restart Rhino, then run this file.")
-            return
+            message = "An older Mesh Guard is still loaded.\nRestart Rhino, then run this file again."
+            log(message)
+            show_message(message, "Mesh Guard Startup")
+            return False
+        if previous.get("busy"):
+            message = "Mesh Guard is already checking or repairing.\nFinish that operation and close its dialog first."
+            log(message)
+            show_message(message, "Mesh Guard Busy")
+            return False
         if (previous.get("version") == VERSION
                 and previous.get("end_open_handler") is on_end_open_document
                 and previous.get("idle_handler") is on_idle):
-            log("Version {} is active. Rechecking can be queued.".format(VERSION))
-            return
-        if previous.get("busy"):
-            log("Close the previous Mesh Repair dialog, then run this file again.")
-            return
+            return True
         pending = dict(previous.get("pending", {}))
         unregister()
     state = {
@@ -1871,8 +1909,8 @@ def register():
         raise
     sc.sticky[HANDLER_KEY] = state
     log("Version {} registered. STL files will be checked after Open/Import.".format(VERSION))
+    return True
 
 
 if __name__ == "__main__":
-    register()
     check_now()
